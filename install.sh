@@ -2,83 +2,67 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN_DIR="$HOME/.local/bin"
+APP_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 
-BIN_DIR="${HOME}/.local/bin"
-APP_DIR="${HOME}/.local/share/applications"
-ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
+CORE_FILE="$SCRIPT_DIR/folder_icon_core.py"
+CLI_FILE="$SCRIPT_DIR/folder-icon"
+GUI_FILE="$SCRIPT_DIR/folder-icon-gui"
+SVG_ICON="$SCRIPT_DIR/folder-icon-gui.svg"
 
-BIN_FILES=("folder-icon" "folder-icon-gui")
-DESKTOP_FILE="folder-icon-gui.desktop"
-ICON_FILE="folder-icon-gui.svg"
-
-uninstall() {
-    echo "Removing Folder-Styler symlinks from ~/.local..."
-    for bin in "${BIN_FILES[@]}"; do
-        rm -f "${BIN_DIR}/${bin}"
-    done
-    rm -f "${APP_DIR}/${DESKTOP_FILE}"
-    rm -f "${ICON_DIR}/${ICON_FILE}"
-
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "${APP_DIR}" >/dev/null 2>&1 || true
-    fi
-    echo "Uninstall complete."
-}
-
-install_links() {
-    echo "Installing Folder-Styler from ${SCRIPT_DIR}..."
-
-    mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}"
-
-    for bin in "${BIN_FILES[@]}"; do
-        src="${SCRIPT_DIR}/${bin}"
-        if [[ ! -f "${src}" ]]; then
-            echo "Error: Required executable not found: ${src}" >&2
-            exit 1
-        fi
-        chmod +x "${src}"
-        ln -sf "${src}" "${BIN_DIR}/${bin}"
-        echo "  Linked ${BIN_DIR}/${bin} -> ${src}"
-    done
-
-    if [[ -f "${SCRIPT_DIR}/${DESKTOP_FILE}" ]]; then
-        ln -sf "${SCRIPT_DIR}/${DESKTOP_FILE}" "${APP_DIR}/${DESKTOP_FILE}"
-        echo "  Linked ${APP_DIR}/${DESKTOP_FILE} -> ${SCRIPT_DIR}/${DESKTOP_FILE}"
-    else
-        echo "  Skipped ${DESKTOP_FILE} (not found in ${SCRIPT_DIR})"
-    fi
-
-    if [[ -f "${SCRIPT_DIR}/${ICON_FILE}" ]]; then
-        ln -sf "${SCRIPT_DIR}/${ICON_FILE}" "${ICON_DIR}/${ICON_FILE}"
-        echo "  Linked ${ICON_DIR}/${ICON_FILE} -> ${SCRIPT_DIR}/${ICON_FILE}"
-    else
-        echo "  Skipped ${ICON_FILE} (not found in ${SCRIPT_DIR})"
-    fi
-
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "${APP_DIR}" >/dev/null 2>&1 || true
-    fi
-
-    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-        gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
-    fi
-
-    echo "Done! Ensure ${BIN_DIR} is in your PATH."
-}
-
-case "${1:-}" in
-    --uninstall|-u)
-        uninstall
-        ;;
-    --help|-h)
-        echo "Usage: ./install.sh [--uninstall]"
-        ;;
-    "")
-        install_links
-        ;;
-    *)
-        echo "Unknown option: $1" >&2
-        echo "Usage: ./install.sh [--uninstall]" >&2
+for req in "$CORE_FILE" "$CLI_FILE" "$GUI_FILE"; do
+    if [[ ! -f "$req" ]]; then
+        echo "Error: Required file not found: $req" >&2
         exit 1
+    fi
+done
+
+chmod +x "$CLI_FILE" "$GUI_FILE"
+
+mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
+ln -sf "$CLI_FILE" "$BIN_DIR/folder-icon"
+ln -sf "$GUI_FILE" "$BIN_DIR/folder-icon-gui"
+
+if [[ -f "$SVG_ICON" ]]; then
+    cp -f "$SVG_ICON" "$ICON_DIR/folder-icon-gui.svg"
+    ICON_ENTRY="folder-icon-gui"
+else
+    ICON_ENTRY="preferences-desktop-color"
+fi
+
+cat > "$APP_DIR/folder-icon-gui.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Folder Styler
+GenericName=Breeze Folder Icon Customizer
+Comment=Customize folder colors and Lucide icons for Dolphin
+Exec=$BIN_DIR/folder-icon-gui %F
+Icon=$ICON_ENTRY
+Terminal=false
+Categories=Utility;System;Qt;
+Keywords=folder;icon;breeze;dolphin;color;lucide;
+StartupNotify=true
+EOF
+
+export PATH="$BIN_DIR:$PATH"
+"$BIN_DIR/folder-icon" preset sync
+
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+fi
+
+if ! python3 -c "import PySide6" >/dev/null 2>&1; then
+    echo "Warning: PySide6 is not installed. The CLI works, but the GUI requires:"
+    echo "  sudo pacman -S python-pyside6"
+fi
+
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+        echo "Warning: $BIN_DIR is not in your PATH."
+        echo "  In Fish shell, run: fish_add_path ~/.local/bin"
         ;;
 esac
+
+echo "Installed folder-icon and folder-icon-gui to $BIN_DIR"

@@ -7,6 +7,7 @@ Usage:
 """
 
 from pathlib import Path
+import re
 import sys
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -54,12 +55,14 @@ except ImportError:
     sys.exit(1)
 
 from folder_icon_core import (
+    ALIAS_FILE,
     LUCIDE_SYMBOLS,
     MAX_SYMBOL_SCALE,
     MIN_SYMBOL_SCALE,
     OUTPUT_DIR,
+    PRESETS_FILE,
     REGISTRY_FILE,
-    ALIAS_FILE,
+    SERVICE_MENU_FILE,
     SYMBOL_CONTRAST_MODE,
     SYMBOL_DIR,
     SYMBOL_SCALE,
@@ -83,14 +86,19 @@ from folder_icon_core import (
     inspect_directory_icon,
     load_custom_symbols,
     load_gui_state,
+    load_presets,
+    move_preset,
     normalize_hex,
     parse_hex,
     remove_alias,
+    remove_preset,
     reset_desktop_icon,
     save_custom_svg_content,
     save_gui_state,
     scan_cache_usage,
     set_alias,
+    sync_dolphin_service_menu,
+    upsert_preset,
     validate_and_extract_svg,
     write_icon,
 )
@@ -288,8 +296,8 @@ QTabBar::tab {
     border-bottom: none;
     border-top-left-radius: 7px;
     border-top-right-radius: 7px;
-    padding: 7px 14px;
-    margin-right: 4px;
+    padding: 7px 12px;
+    margin-right: 3px;
     font-weight: 600;
 }
 
@@ -514,6 +522,60 @@ def format_bytes(num_bytes: int) -> str:
     return f"{num_bytes / 1024.0:.1f} KB"
 
 
+def _read_svg_style_metadata(svg_path: Path) -> dict:
+    """Extract folder color, symbol, glyph color, and scale from an existing SVG."""
+    color = "#3daee9"
+    symbol: str | None = None
+    symbol_color: str | None = None
+    scale = SYMBOL_SCALE
+
+    try:
+        head = svg_path.read_text(encoding="utf-8", errors="replace")[:800]
+    except Exception:
+        return {"color": color, "symbol": symbol, "symbol_color": symbol_color, "scale": scale}
+
+    col_match = re.search(r"Folder color\s*:\s*(#[0-9a-fA-F]{6})", head)
+    if not col_match:
+        col_match = re.search(r'<path\s+fill="(#[0-9a-fA-F]{6})"', head)
+    if col_match:
+        try:
+            color = normalize_hex(col_match.group(1))
+        except FolderIconError:
+            pass
+
+    sym_match = re.search(r"Symbol\s*:\s*(.+)", head)
+    if sym_match:
+        raw_sym = sym_match.group(1).strip().lower()
+        symbol = None if raw_sym in ("", "none") else raw_sym
+
+    sc_match = re.search(r"Symbol color\s*:\s*(.+)", head)
+    if sc_match:
+        raw_sc = sc_match.group(1).strip().lower()
+        if not raw_sc.startswith("auto") and raw_sc not in ("", "n/a", "none"):
+            try:
+                symbol_color = normalize_hex(raw_sc)
+            except FolderIconError:
+                symbol_color = None
+
+    scale_match = re.search(r"Symbol scale\s*:\s*(.+)", head)
+    if scale_match:
+        raw_scale = scale_match.group(1).strip().lower()
+        if raw_scale not in ("", "n/a", "none"):
+            try:
+                parsed = float(raw_scale)
+                if MIN_SYMBOL_SCALE <= parsed <= MAX_SYMBOL_SCALE:
+                    scale = parsed
+            except ValueError:
+                pass
+
+    return {
+        "color": color,
+        "symbol": symbol,
+        "symbol_color": symbol_color,
+        "scale": scale,
+    }
+
+
 def summarize_folder_icon(dir_path: Path) -> str:
     """Return a concise one-line summary of dir_path/.directory icon status."""
     info = inspect_directory_icon(dir_path)
@@ -547,8 +609,8 @@ class FolderIconWindow(QMainWindow):
         icon_file = SCRIPT_DIR / "folder-icon-gui.svg"
         if icon_file.is_file():
             self.setWindowIcon(QIcon(str(icon_file)))
-        self.resize(1040, 680)
-        self.setMinimumSize(900, 580)
+        self.resize(1080, 690)
+        self.setMinimumSize(940, 580)
         self.setAcceptDrops(True)
 
         ensure_dirs()
@@ -557,6 +619,7 @@ class FolderIconWindow(QMainWindow):
         self.all_symbols: dict[str, str] = {}
         self.aliases: dict[str, str] = {}
         self.custom_symbols: dict[str, str] = {}
+        self.presets: list[dict] = []
 
         self.selected_symbol: str | None = "gamepad"
         self.folder_hex: str = (
@@ -589,6 +652,7 @@ class FolderIconWindow(QMainWindow):
 
         self._build_ui()
         self.reload_catalog(preserve_selection=True)
+        self._reload_presets_list()
 
         if len(valid_initial) > 1:
             self.multi_toggle_btn.setChecked(True)
@@ -872,10 +936,12 @@ class FolderIconWindow(QMainWindow):
 
         splitter.addWidget(left_card)
 
-        # === RIGHT PANEL: Symbols, Browse Lucide, Aliases, Cache Cleanup & Options ===
+        # === RIGHT PANEL: Symbols, Gallery, Browse Lucide, Quick Use, Aliases, Cache Cleanup & Options ===
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_symbols_tab(), "Symbols")
+        self.gallery_tab_index = self.tabs.addTab(self._build_gallery_tab(), "Gallery")
         self.lucide_tab_index = self.tabs.addTab(self._build_lucide_browser_tab(), "Browse Lucide")
+        self.presets_tab_index = self.tabs.addTab(self._build_presets_tab(), "Quick Use")
         self.tabs.addTab(self._build_aliases_tab(), "Aliases")
         self.gc_tab_index = self.tabs.addTab(self._build_cache_cleanup_tab(), "Cache Cleanup")
         self.options_tab_index = self.tabs.addTab(self._build_options_tab(), "Options")
@@ -938,6 +1004,152 @@ class FolderIconWindow(QMainWindow):
         layout.addWidget(self.symbol_list, stretch=1)
 
         return tab
+
+    def _build_gallery_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+
+        self.gallery_search_input = QLineEdit()
+        self.gallery_search_input.setPlaceholderText("Filter existing SVGs by name, symbol, or hex...")
+        self.gallery_search_input.setClearButtonEnabled(True)
+        self.gallery_search_input.textChanged.connect(self._populate_gallery_grid)
+
+        self.gallery_refresh_btn = QPushButton("Refresh")
+        self.gallery_refresh_btn.clicked.connect(self._populate_gallery_grid)
+
+        top_bar.addWidget(self.gallery_search_input, stretch=1)
+        top_bar.addWidget(self.gallery_refresh_btn)
+        layout.addLayout(top_bar)
+
+        self.gallery_count_label = QLabel("Open this tab to browse existing folder SVGs.")
+        self.gallery_count_label.setObjectName("MutedLabel")
+        layout.addWidget(self.gallery_count_label)
+
+        self.gallery_list = QListWidget()
+        self.gallery_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.gallery_list.setIconSize(QSize(54, 54))
+        self.gallery_list.setGridSize(QSize(134, 100))
+        self.gallery_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.gallery_list.setMovement(QListWidget.Movement.Static)
+        self.gallery_list.setWordWrap(True)
+        self.gallery_list.itemClicked.connect(self._on_gallery_item_clicked)
+        self.gallery_list.itemActivated.connect(self._on_gallery_item_clicked)
+        layout.addWidget(self.gallery_list, stretch=1)
+
+        return tab
+
+    def _populate_gallery_grid(self, _text: str = "") -> None:
+        query = self.gallery_search_input.text().strip().lower()
+        search_dirs: list[Path] = [OUTPUT_DIR]
+        custom_save_dir = self._get_svg_save_dir()
+        if custom_save_dir != OUTPUT_DIR and custom_save_dir.is_dir():
+            search_dirs.append(custom_save_dir)
+
+        seen_paths: set[Path] = set()
+        svg_files: list[Path] = []
+        for folder in search_dirs:
+            if not folder.is_dir():
+                continue
+            for svg_file in folder.glob("*.svg"):
+                resolved = svg_file.resolve()
+                if resolved not in seen_paths:
+                    seen_paths.add(resolved)
+                    svg_files.append(svg_file)
+
+        svg_files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
+
+        self.gallery_list.blockSignals(True)
+        self.gallery_list.clear()
+
+        shown = 0
+        for svg_file in svg_files:
+            meta = _read_svg_style_metadata(svg_file)
+            sym_label = meta["symbol"] or "none"
+            searchable = f"{svg_file.stem.lower()} {sym_label} {meta['color']}"
+            if query and query not in searchable:
+                continue
+
+            item = QListWidgetItem(render_svg_file_icon(svg_file, size=54), svg_file.stem)
+            item.setData(Qt.ItemDataRole.UserRole, {"path": svg_file, "meta": meta})
+            item.setToolTip(
+                f"File: {svg_file.name}\n"
+                f"Color: {meta['color']}\n"
+                f"Symbol: {sym_label}\n"
+                f"Glyph: {meta['symbol_color'] or 'auto'}\n"
+                f"Scale: {int(round(meta['scale'] * 100))}%\n"
+                f"Click to load style into preview"
+            )
+            self.gallery_list.addItem(item)
+            shown += 1
+
+        self.gallery_list.blockSignals(False)
+        self.gallery_count_label.setText(
+            f"Showing {shown} of {len(svg_files)} existing SVG(s)  •  Click any icon to load its style into preview"
+        )
+
+    def _on_gallery_item_clicked(self, item: QListWidgetItem) -> None:
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            return
+
+        svg_file: Path = payload["path"]
+        meta: dict = payload["meta"]
+
+        self.lucide_preview_name = None
+        self.lucide_preview_inner = None
+        self._set_folder_color(meta["color"])
+
+        raw_sym = meta["symbol"]
+        missing_sym = False
+        if raw_sym and raw_sym not in self.all_symbols:
+            self.selected_symbol = None
+            missing_sym = True
+        else:
+            self.selected_symbol = raw_sym
+
+        sym_col = meta["symbol_color"]
+        modes = ["auto", "white", "black", "custom"]
+        if not sym_col:
+            target_mode = "auto"
+        elif sym_col == "#ffffff":
+            target_mode = "white"
+        elif sym_col == "#000000":
+            target_mode = "black"
+        else:
+            target_mode = "custom"
+            self.custom_symbol_hex = sym_col
+            self.sym_hex_input.blockSignals(True)
+            self.sym_hex_input.setText(sym_col)
+            self.sym_hex_input.blockSignals(False)
+
+        self.contrast_mode = target_mode
+        self.contrast_combo.blockSignals(True)
+        self.contrast_combo.setCurrentIndex(modes.index(target_mode))
+        self.contrast_combo.blockSignals(False)
+        self.sym_hex_input.setEnabled(target_mode == "custom")
+        self.sym_pick_btn.setEnabled(target_mode == "custom")
+
+        scale_pct = int(round(float(meta["scale"]) * 100))
+        self.scale_ratio = scale_pct / 100.0
+        self.scale_slider.blockSignals(True)
+        self.scale_slider.setValue(scale_pct)
+        self.scale_slider.blockSignals(False)
+        self.scale_val_lbl.setText(f"{scale_pct}%")
+
+        self.reload_catalog(preserve_selection=True)
+        self.update_preview()
+
+        if missing_sym:
+            self.status_label.setText(
+                f"Loaded color {meta['color']} from '{svg_file.name}' (symbol '{raw_sym}' is no longer installed)."
+            )
+        else:
+            self.status_label.setText(f"Loaded style from '{svg_file.name}' into preview (file unchanged).")
 
     def _build_lucide_browser_tab(self) -> QWidget:
         tab = QWidget()
@@ -1013,6 +1225,81 @@ class FolderIconWindow(QMainWindow):
         bar_layout.addWidget(self.lucide_import_as_btn)
         bar_layout.addWidget(self.lucide_import_btn)
         layout.addWidget(import_bar)
+
+        return tab
+
+    def _build_presets_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+
+        title = QLabel("DOLPHIN QUICK USE PRESETS")
+        title.setObjectName("SectionTitle")
+
+        self.sync_menu_btn = QPushButton("Sync Dolphin Menu")
+        self.sync_menu_btn.setToolTip(f"Regenerate {SERVICE_MENU_FILE}")
+        self.sync_menu_btn.clicked.connect(self._on_sync_dolphin_menu_clicked)
+
+        self.save_preset_btn = QPushButton("+ Save Current Style as Preset")
+        self.save_preset_btn.setObjectName("PrimaryButton")
+        self.save_preset_btn.clicked.connect(self._on_save_current_preset_clicked)
+
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        header_row.addWidget(self.sync_menu_btn)
+        header_row.addWidget(self.save_preset_btn)
+        layout.addLayout(header_row)
+
+        hint = QLabel(
+            "Saved presets automatically appear in Dolphin's right-click menu under "
+            "'Folder Styler' with their rendered folder icons. Double-click a preset to load it."
+        )
+        hint.setObjectName("MutedLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.presets_list = QListWidget()
+        self.presets_list.setObjectName("LucideBrowserList")
+        self.presets_list.setIconSize(QSize(32, 32))
+        self.presets_list.itemSelectionChanged.connect(self._sync_preset_buttons)
+        self.presets_list.itemDoubleClicked.connect(self._on_load_preset_into_editor)
+        layout.addWidget(self.presets_list, stretch=1)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
+
+        self.preset_load_btn = QPushButton("Load into Editor")
+        self.preset_load_btn.setEnabled(False)
+        self.preset_load_btn.clicked.connect(self._on_load_preset_into_editor)
+
+        self.preset_apply_btn = QPushButton("Apply to Target")
+        self.preset_apply_btn.setEnabled(False)
+        self.preset_apply_btn.clicked.connect(self._on_apply_preset_clicked)
+
+        self.preset_up_btn = QPushButton("Move Up")
+        self.preset_up_btn.setEnabled(False)
+        self.preset_up_btn.clicked.connect(lambda: self._on_move_preset(-1))
+
+        self.preset_down_btn = QPushButton("Move Down")
+        self.preset_down_btn.setEnabled(False)
+        self.preset_down_btn.clicked.connect(lambda: self._on_move_preset(1))
+
+        self.preset_delete_btn = QPushButton("Delete")
+        self.preset_delete_btn.setObjectName("DangerButton")
+        self.preset_delete_btn.setEnabled(False)
+        self.preset_delete_btn.clicked.connect(self._on_delete_preset_clicked)
+
+        footer.addWidget(self.preset_load_btn)
+        footer.addWidget(self.preset_apply_btn)
+        footer.addStretch(1)
+        footer.addWidget(self.preset_up_btn)
+        footer.addWidget(self.preset_down_btn)
+        footer.addWidget(self.preset_delete_btn)
+        layout.addLayout(footer)
 
         return tab
 
@@ -1103,7 +1390,7 @@ class FolderIconWindow(QMainWindow):
 
         hint = QLabel(
             f"Syncs tracked folders and scans home directories against {OUTPUT_DIR}. "
-            "Checked SVGs are not referenced by any .directory file."
+            "Checked SVGs are not referenced by any .directory file or Quick Use preset."
         )
         hint.setObjectName("MutedLabel")
         hint.setWordWrap(True)
@@ -1218,6 +1505,8 @@ class FolderIconWindow(QMainWindow):
         for label_text, path_val in (
             ("Icon Cache:", OUTPUT_DIR),
             ("Custom Symbols:", SYMBOL_DIR),
+            ("Quick Use Presets:", PRESETS_FILE),
+            ("Dolphin Menu:", SERVICE_MENU_FILE),
             ("Aliases File:", ALIAS_FILE),
             ("Folder Registry:", REGISTRY_FILE),
         ):
@@ -1225,7 +1514,7 @@ class FolderIconWindow(QMainWindow):
             row.setSpacing(8)
             k_lbl = QLabel(label_text)
             k_lbl.setObjectName("MutedLabel")
-            k_lbl.setFixedWidth(120)
+            k_lbl.setFixedWidth(130)
             v_lbl = QLabel(str(path_val))
             v_lbl.setStyleSheet("background-color: transparent; color: #e4e4e7; font-size: 12px;")
             v_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1238,6 +1527,194 @@ class FolderIconWindow(QMainWindow):
 
         self._refresh_options_status()
         return tab
+
+    # -----------------------------------------------------------------------
+    # QUICK USE PRESETS MANAGEMENT
+    # -----------------------------------------------------------------------
+
+    def _reload_presets_list(self, select_row: int = -1) -> None:
+        self.presets = load_presets()
+        self.presets_list.blockSignals(True)
+        self.presets_list.clear()
+
+        for preset in self.presets:
+            sym = preset.get("symbol")
+            col = preset["color"]
+            sym_col = preset.get("symbol_color")
+            scale = float(preset.get("scale", SYMBOL_SCALE))
+
+            try:
+                svg_markup = build_folder_svg(
+                    hex_color=col,
+                    symbol=sym,
+                    symbol_color=sym_col,
+                    all_symbols=self.all_symbols,
+                    scale_ratio=scale,
+                )
+                icon = render_svg_icon(svg_markup, size=32)
+            except FolderIconError:
+                icon = QIcon()
+
+            sym_text = sym or "none"
+            glyph_text = sym_col or "auto"
+            scale_pct = int(round(scale * 100))
+            label = f"{preset['name']}    [{col}  •  {sym_text}  •  glyph: {glyph_text}  •  {scale_pct}%]"
+
+            item = QListWidgetItem(icon, label)
+            item.setData(Qt.ItemDataRole.UserRole, preset)
+            self.presets_list.addItem(item)
+
+        if 0 <= select_row < self.presets_list.count():
+            self.presets_list.setCurrentRow(select_row)
+
+        self.presets_list.blockSignals(False)
+        self._sync_preset_buttons()
+
+    def _sync_preset_buttons(self) -> None:
+        row = self.presets_list.currentRow()
+        count = self.presets_list.count()
+        has_sel = 0 <= row < count
+
+        self.preset_load_btn.setEnabled(has_sel)
+        self.preset_apply_btn.setEnabled(has_sel)
+        self.preset_delete_btn.setEnabled(has_sel)
+        self.preset_up_btn.setEnabled(has_sel and row > 0)
+        self.preset_down_btn.setEnabled(has_sel and row < count - 1)
+
+    def _on_save_current_preset_clicked(self) -> None:
+        if not self._ensure_preview_imported_if_needed():
+            return
+
+        canon_sym = canonical_symbol_name(self.selected_symbol, self.aliases)
+        default_name = f"{canon_sym or 'folder'} {self.folder_hex}".title()
+        entered, ok = QInputDialog.getText(
+            self,
+            "Save Quick Use Preset",
+            "Preset name (shown in Dolphin's right-click menu):",
+            text=default_name,
+        )
+        if not ok or not entered.strip():
+            return
+
+        sym_override = self._effective_symbol_color_arg()
+        try:
+            entry = upsert_preset(
+                name=entered.strip(),
+                color=self.folder_hex,
+                symbol=canon_sym,
+                symbol_color=sym_override,
+                scale=self.scale_ratio,
+            )
+        except FolderIconError as exc:
+            QMessageBox.critical(self, "Preset Error", str(exc))
+            return
+
+        self._reload_presets_list()
+        for idx, p in enumerate(self.presets):
+            if p["name"].lower() == entry["name"].lower():
+                self.presets_list.setCurrentRow(idx)
+                break
+        self.status_label.setText(
+            f"Saved preset '{entry['name']}' and updated Dolphin menu ({SERVICE_MENU_FILE})."
+        )
+
+    def _on_load_preset_into_editor(self, _item: QListWidgetItem | None = None) -> None:
+        row = self.presets_list.currentRow()
+        if not (0 <= row < len(self.presets)):
+            return
+
+        preset = self.presets[row]
+        self.lucide_preview_name = None
+        self.lucide_preview_inner = None
+
+        self._set_folder_color(preset["color"])
+        self.selected_symbol = preset.get("symbol")
+
+        sym_col = preset.get("symbol_color")
+        modes = ["auto", "white", "black", "custom"]
+        if not sym_col:
+            target_mode = "auto"
+        elif sym_col == "#ffffff":
+            target_mode = "white"
+        elif sym_col == "#000000":
+            target_mode = "black"
+        else:
+            target_mode = "custom"
+            self.custom_symbol_hex = sym_col
+            self.sym_hex_input.blockSignals(True)
+            self.sym_hex_input.setText(sym_col)
+            self.sym_hex_input.blockSignals(False)
+
+        self.contrast_mode = target_mode
+        self.contrast_combo.blockSignals(True)
+        self.contrast_combo.setCurrentIndex(modes.index(target_mode))
+        self.contrast_combo.blockSignals(False)
+        self.sym_hex_input.setEnabled(target_mode == "custom")
+        self.sym_pick_btn.setEnabled(target_mode == "custom")
+
+        scale_pct = int(round(float(preset.get("scale", SYMBOL_SCALE)) * 100))
+        self.scale_ratio = scale_pct / 100.0
+        self.scale_slider.blockSignals(True)
+        self.scale_slider.setValue(scale_pct)
+        self.scale_slider.blockSignals(False)
+        self.scale_val_lbl.setText(f"{scale_pct}%")
+
+        self.reload_catalog(preserve_selection=True)
+        self.update_preview()
+        self.status_label.setText(f"Loaded preset '{preset['name']}' into editor.")
+
+    def _on_apply_preset_clicked(self) -> None:
+        row = self.presets_list.currentRow()
+        if not (0 <= row < len(self.presets)):
+            return
+        self._on_load_preset_into_editor()
+        self._on_apply_clicked()
+
+    def _on_move_preset(self, delta: int) -> None:
+        row = self.presets_list.currentRow()
+        if not (0 <= row < len(self.presets)):
+            return
+        new_row = row + delta
+        if not (0 <= new_row < len(self.presets)):
+            return
+        try:
+            move_preset(row, delta)
+        except FolderIconError as exc:
+            QMessageBox.critical(self, "Preset Error", str(exc))
+        self._reload_presets_list(select_row=new_row)
+        self.status_label.setText("Updated preset order and synced Dolphin menu.")
+
+    def _on_delete_preset_clicked(self) -> None:
+        row = self.presets_list.currentRow()
+        if not (0 <= row < len(self.presets)):
+            return
+        preset = self.presets[row]
+        reply = QMessageBox.question(
+            self,
+            "Delete Quick Use Preset?",
+            f"Remove '{preset['name']}' from Quick Use presets and Dolphin's context menu?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            remove_preset(preset["name"])
+        except FolderIconError as exc:
+            QMessageBox.critical(self, "Error", str(exc))
+            return
+
+        self._reload_presets_list(select_row=min(row, max(0, len(self.presets) - 2)))
+        self.status_label.setText(f"Deleted preset '{preset['name']}' and synced Dolphin menu.")
+
+    def _on_sync_dolphin_menu_clicked(self) -> None:
+        try:
+            path = sync_dolphin_service_menu()
+        except Exception as exc:
+            QMessageBox.critical(self, "Sync Failed", str(exc))
+            return
+        self.status_label.setText(f"Dolphin service menu synced -> {path}")
 
     # -----------------------------------------------------------------------
     # OPTIONS & SAVE PATH HELPERS
@@ -1397,8 +1874,12 @@ class FolderIconWindow(QMainWindow):
         worker.deleteLater()
 
     def _on_tab_changed(self, index: int) -> None:
-        if index == self.lucide_tab_index and not self.lucide_index_loaded:
+        if index == self.gallery_tab_index:
+            self._populate_gallery_grid()
+        elif index == self.lucide_tab_index and not self.lucide_index_loaded:
             self._load_lucide_index(force_refresh=False)
+        elif index == self.presets_tab_index:
+            self._reload_presets_list(select_row=self.presets_list.currentRow())
         elif index == self.gc_tab_index and not self._cache_scanning:
             self._start_cache_scan()
 
@@ -1639,7 +2120,7 @@ class FolderIconWindow(QMainWindow):
     def _ensure_preview_imported_if_needed(self) -> bool:
         """
         If the folder preview is currently showing an un-imported online Lucide icon,
-        offer to import it into SYMBOL_DIR before applying or saving.
+        offer to import it into SYMBOL_DIR before applying, saving, or creating a preset.
         """
         if not self.lucide_preview_name:
             return True

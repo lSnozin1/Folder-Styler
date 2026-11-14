@@ -1,6 +1,6 @@
 """
-folder_icon_core.py - Shared SVG generation, symbol, alias, registry,
-and .directory engine for folder-icon (CLI) and folder-icon-gui (PySide6).
+folder_icon_core.py - Shared SVG generation, symbol, alias, registry, Quick Use presets,
+Dolphin service menu, and .directory engine for folder-icon (CLI) and folder-icon-gui (PySide6).
 """
 
 from datetime import datetime, timezone
@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 
@@ -23,6 +25,11 @@ ALIAS_FILE = OUTPUT_DIR / "aliases.json"
 GUI_STATE_FILE = OUTPUT_DIR / "gui_state.json"
 REGISTRY_FILE = OUTPUT_DIR / "registry.json"
 LUCIDE_INDEX_FILE = OUTPUT_DIR / "lucide_index.json"
+PRESETS_FILE = OUTPUT_DIR / "presets.json"
+
+# Dolphin right-click menu (KDE service menu) generated from Quick Use presets
+SERVICE_MENU_DIR = Path.home() / ".local" / "share" / "kio" / "servicemenus"
+SERVICE_MENU_FILE = SERVICE_MENU_DIR / "folder-styler.desktop"
 
 LUCIDE_TREE_API_URL = "https://api.github.com/repos/lucide-icons/lucide/git/trees/main?recursive=1"
 LUCIDE_RAW_SVG_URL = "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/{name}.svg"
@@ -1028,6 +1035,338 @@ def reset_desktop_icon(dir_path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# QUICK USE PRESETS & DOLPHIN SERVICE MENU
+# ---------------------------------------------------------------------------
+
+def _atomic_write_text(path: Path, content: str, mode: int | None = None) -> None:
+    """Write text via a temp file in the same directory, then rename into place."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    if mode is not None:
+        tmp.chmod(mode)
+    os.replace(tmp, path)
+
+
+def _clean_preset(item: object) -> dict | None:
+    """Normalize one raw preset entry; return None if it is unusable."""
+    if not isinstance(item, dict):
+        return None
+
+    name = " ".join(str(item.get("name", "")).split())
+    if not name:
+        return None
+
+    try:
+        color = normalize_hex(str(item.get("color", "")))
+    except FolderIconError:
+        return None
+
+    raw_symbol = item.get("symbol")
+    symbol = str(raw_symbol).strip().lower() if raw_symbol else None
+    if not symbol or symbol == "none":
+        symbol = None
+
+    symbol_color: str | None = None
+    raw_symbol_color = item.get("symbol_color")
+    if symbol and raw_symbol_color:
+        try:
+            symbol_color = normalize_hex(str(raw_symbol_color))
+        except FolderIconError:
+            symbol_color = None
+
+    try:
+        scale = parse_scale(item.get("scale", SYMBOL_SCALE))
+    except FolderIconError:
+        scale = round(float(SYMBOL_SCALE), 4)
+
+    return {
+        "name": name,
+        "color": color,
+        "symbol": symbol,
+        "symbol_color": symbol_color,
+        "scale": scale,
+    }
+
+
+def load_presets() -> list[dict]:
+    """Load Quick Use presets from presets.json (ordered, invalid entries skipped)."""
+    if not PRESETS_FILE.is_file():
+        return []
+    try:
+        data = json.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    if isinstance(data, dict):
+        data = data.get("presets")
+    if not isinstance(data, list):
+        return []
+
+    presets: list[dict] = []
+    seen: set[str] = set()
+    for raw in data:
+        entry = _clean_preset(raw)
+        if entry is None:
+            continue
+        key = entry["name"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        presets.append(entry)
+    return presets
+
+
+def save_presets(presets: list[dict], sync_menu: bool = True) -> None:
+    """
+    Persist presets to presets.json and (optionally) regenerate the Dolphin menu.
+    Raises FolderIconError if the presets were saved but the menu could not be written.
+    """
+    ensure_dirs()
+    _atomic_write_text(PRESETS_FILE, json.dumps(presets, indent=2) + "\n")
+    if sync_menu:
+        try:
+            sync_dolphin_service_menu(presets)
+        except OSError as exc:
+            raise FolderIconError(
+                f"Presets saved, but the Dolphin menu could not be updated: {exc}"
+            ) from exc
+
+
+def upsert_preset(
+    name: str,
+    color: str,
+    symbol: str | None = None,
+    symbol_color: str | None = None,
+    scale: float | str = SYMBOL_SCALE,
+) -> dict:
+    """Create a preset, or replace the existing one with the same name (case-insensitive)."""
+    clean_name = " ".join(name.split())
+    if not clean_name:
+        raise FolderIconError("Preset name cannot be empty.")
+
+    norm_color = normalize_hex(color)
+    ratio = parse_scale(scale)
+
+    all_symbols, aliases = get_all_symbols()
+    canon = canonical_symbol_name(symbol, aliases)
+    if canon is not None and canon not in all_symbols:
+        raise FolderIconError(f"Unknown symbol '{symbol}'. Run 'folder-icon list' to see available symbols.")
+
+    norm_symbol_color = normalize_hex(symbol_color) if (canon and symbol_color) else None
+
+    entry = {
+        "name": clean_name,
+        "color": norm_color,
+        "symbol": canon,
+        "symbol_color": norm_symbol_color,
+        "scale": ratio,
+    }
+
+    presets = load_presets()
+    for idx, existing in enumerate(presets):
+        if existing["name"].lower() == clean_name.lower():
+            presets[idx] = entry
+            break
+    else:
+        presets.append(entry)
+
+    save_presets(presets, sync_menu=True)
+    return entry
+
+
+def remove_preset(name: str) -> dict:
+    """Remove a preset by name (case-insensitive) and return the removed entry."""
+    target = " ".join(name.split()).lower()
+    if not target:
+        raise FolderIconError("Preset name cannot be empty.")
+
+    presets = load_presets()
+    for idx, existing in enumerate(presets):
+        if existing["name"].lower() == target:
+            removed = presets.pop(idx)
+            save_presets(presets, sync_menu=True)
+            return removed
+    raise FolderIconError(f"Preset '{name}' does not exist.")
+
+
+def move_preset(index: int, delta: int) -> list[dict]:
+    """Move the preset at index by delta positions (menu order) and return the new list."""
+    presets = load_presets()
+    new_index = index + delta
+    if 0 <= index < len(presets) and 0 <= new_index < len(presets):
+        presets[index], presets[new_index] = presets[new_index], presets[index]
+        save_presets(presets, sync_menu=True)
+    return presets
+
+
+def get_preset(name: str) -> dict | None:
+    """Return a preset by name (case-insensitive), or None."""
+    target = " ".join(name.split()).lower()
+    for existing in load_presets():
+        if existing["name"].lower() == target:
+            return existing
+    return None
+
+
+def preset_icon_path(preset: dict, aliases: dict[str, str] | None = None) -> Path:
+    """Cache SVG path that a preset resolves to (same naming as a CLI/GUI apply)."""
+    return icon_path(
+        symbol=preset.get("symbol"),
+        hex_color=preset["color"],
+        symbol_color=preset.get("symbol_color"),
+        scale_ratio=float(preset.get("scale", SYMBOL_SCALE)),
+        aliases=aliases,
+    )
+
+
+def preset_icon_paths(presets: list[dict] | None = None) -> dict[Path, list[str]]:
+    """Map each cached SVG referenced by a preset to the preset names using it."""
+    active = presets if presets is not None else load_presets()
+    aliases = load_user_aliases()
+    users: dict[Path, list[str]] = {}
+    for preset in active:
+        try:
+            resolved = preset_icon_path(preset, aliases).resolve()
+        except FolderIconError:
+            continue
+        users.setdefault(resolved, []).append(preset["name"])
+    return users
+
+
+def _find_tool(tool: str) -> list[str] | None:
+    """Locate an executable (PATH first, then next to this module); None if not found."""
+    found = shutil.which(tool)
+    if found:
+        return [found]
+    sibling = Path(__file__).resolve().parent / tool
+    if sibling.is_file():
+        if os.access(sibling, os.X_OK):
+            return [str(sibling)]
+        return [sys.executable or "python3", str(sibling)]
+    return None
+
+
+def _exec_quote(arg: str) -> str:
+    """Quote one argument for a .desktop Exec= line (Desktop Entry spec)."""
+    out: list[str] = []
+    for ch in arg:
+        if ch == "\\":
+            out.append("\\\\\\\\")
+        elif ch in '"`$':
+            out.append("\\" + ch)
+        elif ch == "%":
+            out.append("%%")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _desktop_value(text: str) -> str:
+    """Escape a plain string for use as a .desktop value (Name=, etc.)."""
+    return " ".join(text.split()).replace("\\", "\\\\")
+
+
+def sync_dolphin_service_menu(presets: list[dict] | None = None) -> Path:
+    """
+    Regenerate ~/.local/share/kio/servicemenus/folder-styler.desktop.
+
+    Adds a 'Folder Styler' submenu to Dolphin's folder context menu with one action per
+    Quick Use preset (rendered folder icon included), plus Open GUI / Open Icons Folder /
+    Revert to Default Icon. Preset actions call: folder-icon apply %F <symbol|none> <color> ... --force
+    """
+    ensure_dirs()
+    SERVICE_MENU_DIR.mkdir(parents=True, exist_ok=True)
+
+    active = presets if presets is not None else load_presets()
+    all_symbols, aliases = get_all_symbols()
+
+    cli = " ".join(_exec_quote(part) for part in (_find_tool("folder-icon") or ["folder-icon"]))
+    gui_cmd = _find_tool("folder-icon-gui")
+
+    action_ids: list[str] = []
+    blocks: list[str] = []
+
+    for idx, preset in enumerate(active):
+        symbol = preset.get("symbol")
+        if symbol and symbol not in all_symbols:
+            continue  # symbol was deleted; skip instead of showing a broken entry
+
+        try:
+            svg_path = preset_icon_path(preset, aliases)
+            if not svg_path.is_file():
+                write_icon(
+                    build_folder_svg(
+                        hex_color=preset["color"],
+                        symbol=symbol,
+                        symbol_color=preset.get("symbol_color"),
+                        all_symbols=all_symbols,
+                        scale_ratio=float(preset.get("scale", SYMBOL_SCALE)),
+                    ),
+                    svg_path,
+                )
+        except (FolderIconError, OSError):
+            continue
+
+        parts = [cli, "apply", "%F", _exec_quote(symbol or "none"), _exec_quote(preset["color"])]
+        if symbol and preset.get("symbol_color"):
+            parts += ["--symbol-color", _exec_quote(preset["symbol_color"])]
+        parts += ["--scale", f"{float(preset.get('scale', SYMBOL_SCALE)):.4f}", "--force"]
+
+        action_id = f"preset{idx}"
+        action_ids.append(action_id)
+        blocks.append(
+            f"[Desktop Action {action_id}]\n"
+            f"Name={_desktop_value(preset['name'])}\n"
+            f"Icon={svg_path.resolve()}\n"
+            f"Exec={' '.join(parts)}\n"
+        )
+
+    if action_ids:
+        action_ids.append("_SEPARATOR_")
+
+    if gui_cmd:
+        gui_exec = " ".join([*(_exec_quote(part) for part in gui_cmd), "%F"])
+        action_ids.append("openGui")
+        blocks.append(
+            "[Desktop Action openGui]\n"
+            "Name=Open Folder Styler...\n"
+            "Icon=preferences-desktop-color\n"
+            f"Exec={gui_exec}\n"
+        )
+
+    action_ids.append("openIcons")
+    blocks.append(
+        "[Desktop Action openIcons]\n"
+        "Name=Open Icons Folder\n"
+        "Icon=folder-open\n"
+        f"Exec=xdg-open {_exec_quote(str(OUTPUT_DIR.resolve()))}\n"
+    )
+
+    action_ids.append("revertFolder")
+    blocks.append(
+        "[Desktop Action revertFolder]\n"
+        "Name=Revert to Default Icon\n"
+        "Icon=edit-undo\n"
+        f"Exec={cli} reset %F --force\n"
+    )
+
+    content = (
+        "[Desktop Entry]\n"
+        "Type=Service\n"
+        "X-KDE-ServiceTypes=KonqPopupMenu/Plugin\n"
+        "MimeType=inode/directory;\n"
+        f"Actions={';'.join(action_ids)};\n"
+        "X-KDE-Submenu=Folder Styler\n"
+        "Icon=preferences-desktop-color\n"
+        "\n" + "\n".join(blocks)
+    )
+
+    _atomic_write_text(SERVICE_MENU_FILE, content, mode=0o755)
+    return SERVICE_MENU_FILE
+
+
+# ---------------------------------------------------------------------------
 # CACHE GARBAGE COLLECTION & REGISTRY SYNC
 # ---------------------------------------------------------------------------
 
@@ -1064,6 +1403,7 @@ def scan_cache_usage(scan_root: Path | None = None) -> dict:
     """
     Synchronize registry.json against live .directory files (including changes made
     manually in Dolphin) and partition cached SVGs in OUTPUT_DIR into 'in_use' and 'orphaned'.
+    SVGs referenced by a Quick Use preset (Dolphin menu icons) count as in use.
     """
     ensure_dirs()
     cache_root = OUTPUT_DIR.resolve()
@@ -1111,6 +1451,8 @@ def scan_cache_usage(scan_root: Path | None = None) -> dict:
         icon_p = Path(entry["icon"]).resolve()
         icon_users.setdefault(icon_p, []).append(folder_str)
 
+    preset_users = preset_icon_paths()
+
     in_use: list[dict] = []
     orphaned: list[dict] = []
 
@@ -1122,14 +1464,16 @@ def scan_cache_usage(scan_root: Path | None = None) -> dict:
             size_bytes = 0
 
         users = sorted(icon_users.get(resolved_svg, []))
+        preset_names = sorted(preset_users.get(resolved_svg, []))
         record = {
             "path": svg_file,
             "name": svg_file.name,
             "size": size_bytes,
             "folders": users,
+            "presets": preset_names,
             "metadata": _parse_svg_header_metadata(svg_file),
         }
-        if users:
+        if users or preset_names:
             in_use.append(record)
         else:
             orphaned.append(record)

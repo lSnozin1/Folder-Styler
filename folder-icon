@@ -10,6 +10,11 @@ Usage:
     folder-icon info <folder-path>...
     folder-icon gc [--dry-run] [--force]
     folder-icon alias [<target> to <alias> | remove <alias>] [--force]
+    folder-icon preset list
+    folder-icon preset add <name> <symbol|none> <hex-color> [--symbol-color <hex>] [--scale <val>]
+    folder-icon preset remove <name>
+    folder-icon preset apply <name> <folder-path>... [--force]
+    folder-icon preset sync
 """
 
 from pathlib import Path
@@ -24,6 +29,8 @@ from folder_icon_core import (
     MAX_SYMBOL_SCALE,
     MIN_SYMBOL_SCALE,
     OUTPUT_DIR,
+    PRESETS_FILE,
+    SERVICE_MENU_FILE,
     SYMBOL_DIR,
     SYMBOL_SCALE,
     FolderIconError,
@@ -35,15 +42,20 @@ from folder_icon_core import (
     ensure_dirs,
     get_all_symbols,
     get_existing_directory_contents,
+    get_preset,
     icon_path,
     inspect_directory_icon,
     load_custom_symbols,
+    load_presets,
     normalize_hex,
     parse_scale,
     remove_alias,
+    remove_preset,
     reset_desktop_icon,
     scan_cache_usage,
     set_alias,
+    sync_dolphin_service_menu,
+    upsert_preset,
     write_icon,
 )
 
@@ -142,6 +154,15 @@ def cmd_list(_args: list[str]) -> None:
         for entry in invalid_custom:
             print(f"  {entry}")
 
+    presets = load_presets()
+    if presets:
+        print(f"\nQuick Use presets (Dolphin right-click menu, from {PRESETS_FILE}):")
+        for preset in presets:
+            print(f"  {format_preset(preset)}")
+    else:
+        print("\nQuick Use presets: none")
+        print("  (create one with: folder-icon preset add <name> <symbol|none> <hex-color>)")
+
 
 def cmd_alias(args: list[str]) -> None:
     force = "--force" in args or "-f" in args
@@ -205,6 +226,150 @@ def cmd_alias(args: list[str]) -> None:
 
     set_alias(target_name, alias_name)
     print(f"Alias created: {alias_name} -> {target_name}")
+
+
+def format_preset(preset: dict) -> str:
+    sym = preset.get("symbol") or "none"
+    glyph = preset.get("symbol_color") or "auto"
+    return (
+        f"{preset['name']}  |  color={preset['color']}  symbol={sym}  "
+        f"glyph={glyph}  scale={preset['scale']:.2f}"
+    )
+
+
+def cmd_preset(args: list[str]) -> None:
+    usage = (
+        "Usage: folder-icon preset list\n"
+        "   or: folder-icon preset add <name> <symbol|none> <hex-color> [--symbol-color <hex>] [--scale <val>]\n"
+        "   or: folder-icon preset remove <name>\n"
+        '   or: folder-icon preset apply "<name>" <folder-path>... [--force]\n'
+        "   or: folder-icon preset sync"
+    )
+
+    if not args:
+        action, rest = "list", []
+    else:
+        action, rest = args[0].lower(), args[1:]
+
+    if action in ("list", "ls"):
+        presets = load_presets()
+        if not presets:
+            print("No Quick Use presets saved.")
+            print("  Create one with: folder-icon preset add <name> <symbol|none> <hex-color>")
+        else:
+            print(f"Quick Use presets ({PRESETS_FILE}):")
+            for idx, preset in enumerate(presets, start=1):
+                print(f"  {idx}. {format_preset(preset)}")
+        print(f"\nDolphin menu file: {SERVICE_MENU_FILE}")
+        return
+
+    if action == "add":
+        positional: list[str] = []
+        symbol_color: str | None = None
+        scale_ratio: float = SYMBOL_SCALE
+
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "--symbol-color":
+                if i + 1 >= len(rest):
+                    die("--symbol-color requires a hex color argument")
+                symbol_color = validate_color(rest[i + 1])
+                i += 2
+            elif arg.startswith("--symbol-color="):
+                symbol_color = validate_color(arg.split("=", 1)[1])
+                i += 1
+            elif arg == "--scale":
+                if i + 1 >= len(rest):
+                    die("--scale requires a numeric argument (e.g. 0.45 or 55%)")
+                scale_ratio = validate_scale(rest[i + 1])
+                i += 2
+            elif arg.startswith("--scale="):
+                scale_ratio = validate_scale(arg.split("=", 1)[1])
+                i += 1
+            elif arg.startswith("-"):
+                die(f"Unknown flag: {arg}")
+            else:
+                positional.append(arg)
+                i += 1
+
+        if len(positional) < 3:
+            die(usage)
+
+        name = " ".join(positional[:-2])
+        all_symbols, _ = get_all_symbols()
+        symbol = validate_symbol(positional[-2].lower(), all_symbols)
+        hex_color = validate_color(positional[-1])
+
+        try:
+            entry = upsert_preset(
+                name=name,
+                color=hex_color,
+                symbol=symbol,
+                symbol_color=symbol_color,
+                scale=scale_ratio,
+            )
+        except FolderIconError as exc:
+            die(str(exc))
+            return
+        print(f"Saved preset: {format_preset(entry)}")
+        print(f"Dolphin menu updated: {SERVICE_MENU_FILE}")
+        return
+
+    if action in ("remove", "rm", "delete"):
+        if not rest:
+            die(usage)
+        try:
+            removed = remove_preset(" ".join(rest))
+        except FolderIconError as exc:
+            die(str(exc))
+            return
+        print(f"Removed preset: '{removed['name']}'")
+        print(f"Dolphin menu updated: {SERVICE_MENU_FILE}")
+        return
+
+    if action == "apply":
+        positional = []
+        force = False
+        for arg in rest:
+            if arg in ("--force", "-f"):
+                force = True
+            elif arg.startswith("-"):
+                die(f"Unknown flag: {arg}")
+            else:
+                positional.append(arg)
+
+        if len(positional) < 2:
+            die(usage)
+
+        preset = get_preset(positional[0])
+        if preset is None:
+            names = ", ".join(p["name"] for p in load_presets()) or "(none)"
+            die(f"Preset '{positional[0]}' does not exist. Available: {names}")
+            return
+
+        apply_args = list(positional[1:])
+        apply_args += [preset.get("symbol") or "none", preset["color"]]
+        if preset.get("symbol") and preset.get("symbol_color"):
+            apply_args += ["--symbol-color", preset["symbol_color"]]
+        apply_args += ["--scale", f"{preset['scale']:.4f}"]
+        if force:
+            apply_args.append("--force")
+
+        print(f"Applying preset '{preset['name']}'")
+        cmd_apply(apply_args)
+        return
+
+    if action == "sync":
+        try:
+            path = sync_dolphin_service_menu()
+        except OSError as exc:
+            die(f"Could not write Dolphin menu: {exc}")
+            return
+        print(f"Dolphin menu regenerated: {path}")
+        return
+
+    die(usage)
 
 
 def cmd_make(args: list[str]) -> None:
@@ -592,6 +757,14 @@ Usage:
   folder-icon alias [<target> to <alias> | remove <alias>] [--force]
       Create, list, or remove symbol aliases. Warns about conflicts.
 
+  folder-icon preset list
+  folder-icon preset add <name> <symbol|none> <hex-color> [--symbol-color <hex>] [--scale <val>]
+  folder-icon preset remove <name>
+  folder-icon preset apply "<name>" <folder-path>... [--force]
+  folder-icon preset sync
+      Quick Use presets. Every preset shows up in Dolphin's right-click menu
+      under 'Folder Styler' (~/.local/share/kio/servicemenus/folder-styler.desktop).
+
 Custom symbols:
   Drop any 24x24 SVG from https://lucide.dev into ~/.local/share/folder-icons/symbols/<name>.svg
 """
@@ -620,6 +793,8 @@ def main() -> None:
         cmd_gc(rest)
     elif command in ("alias", "aliases"):
         cmd_alias(rest)
+    elif command in ("preset", "presets"):
+        cmd_preset(rest)
     else:
         die(f"Unknown command '{command}'. Run 'folder-icon --help' for usage.")
 
