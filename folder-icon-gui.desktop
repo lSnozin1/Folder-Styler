@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Folder Styler
+GenericName=Breeze Folder Icon Generator
+Comment=Customize Breeze folder colors and Lucide symbols
+Exec=folder-icon-gui
+Icon=folder-icon-gui
+Terminal=false
+Categories=Utility;Graphics;Qt;
+Keywords=folder;icon;breeze;lucide;theme;customize;
+StartupWMClass=folder-icon-gui
