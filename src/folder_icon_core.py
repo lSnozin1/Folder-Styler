@@ -880,6 +880,10 @@ def inspect_directory_icon(dir_path: Path) -> dict:
 
     if icon_val:
         candidate = Path(icon_val).expanduser()
+        if not candidate.is_absolute():
+            rel_candidate = (dir_path / candidate).resolve()
+            if rel_candidate.is_file():
+                candidate = rel_candidate
         if candidate.is_absolute():
             icon_exists = candidate.is_file()
             try:
@@ -1235,11 +1239,15 @@ def preset_icon_paths(presets: list[dict] | None = None) -> dict[Path, list[str]
 
 
 def _find_tool(tool: str) -> list[str] | None:
-    """Locate an executable (PATH first, then next to this module); None if not found."""
+    """Locate an executable (PATH first, then next to this module or in bin/); None if not found."""
     found = shutil.which(tool)
     if found:
         return [found]
     sibling = Path(__file__).resolve().parent / tool
+    if not sibling.is_file():
+        bin_sibling = Path(__file__).resolve().parent.parent / "bin" / tool
+        if bin_sibling.is_file():
+            sibling = bin_sibling
     if sibling.is_file():
         if os.access(sibling, os.X_OK):
             return [str(sibling)]

@@ -11,8 +11,10 @@ import re
 import sys
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+SRC_DIR = SCRIPT_DIR.parent / "src"
+for path in (SRC_DIR, SCRIPT_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 try:
     from PySide6.QtCore import QByteArray, QSize, Qt, QThread, Signal
@@ -606,9 +608,13 @@ class FolderIconWindow(QMainWindow):
     def __init__(self, initial_folders: list[Path] | None = None) -> None:
         super().__init__()
         self.setWindowTitle("folder-icon — Breeze Folder Styler")
-        icon_file = SCRIPT_DIR / "folder-icon-gui.svg"
+        icon_file = SCRIPT_DIR.parent / "assets" / "folder-icon-gui.svg"
+        if not icon_file.is_file():
+            icon_file = SCRIPT_DIR / "folder-icon-gui.svg"
         if icon_file.is_file():
             self.setWindowIcon(QIcon(str(icon_file)))
+        else:
+            self.setWindowIcon(QIcon.fromTheme("folder-icon-gui"))
         self.resize(1080, 690)
         self.setMinimumSize(940, 580)
         self.setAcceptDrops(True)

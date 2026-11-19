@@ -86,10 +86,10 @@ This script automatically creates the following symlinks in your home directory:
 
 | Symlink Created | Target | Purpose |
 | :--- | :--- | :--- |
-| `~/.local/bin/folder-icon` | `Folder-Styler/folder-icon` | Command-line tool |
-| `~/.local/bin/folder-icon-gui` | `Folder-Styler/folder-icon-gui` | Desktop GUI application |
-| `~/.local/share/applications/folder-icon-gui.desktop` | `Folder-Styler/folder-icon-gui.desktop` | Application menu / launcher entry |
-| `~/.local/share/icons/hicolor/scalable/apps/folder-icon-gui.svg` | `Folder-Styler/folder-icon-gui.svg` | Application launcher icon |
+| `~/.local/bin/folder-icon` | `Folder-Styler/bin/folder-icon` | Command-line tool |
+| `~/.local/bin/folder-icon-gui` | `Folder-Styler/bin/folder-icon-gui` | Desktop GUI application |
+| `~/.local/share/applications/folder-icon-gui.desktop` | Generated desktop entry | Application menu / launcher entry |
+| `~/.local/share/icons/hicolor/scalable/apps/folder-icon-gui.svg` | `Folder-Styler/assets/folder-icon-gui.svg` | Application launcher icon |
 
 ### 3. Verify Your `PATH`
 
